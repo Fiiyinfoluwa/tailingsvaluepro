@@ -95,74 +95,6 @@ streamlit run app.py
 
 ---
 
-## Configure The Groq API Key
-
-This app now reads the API key from **Streamlit secrets**.
-
-For local use, create:
-
-```text
-.streamlit/secrets.toml
-```
-
-With:
-
-```toml
-GROQ_API_KEY = "gsk_..."
-```
-
-For Streamlit Community Cloud, add the same key in:
-
-`App Settings -> Secrets`
-
-The app will not ask end users to paste an API key.
-
----
-
-## Deploy To Streamlit Community Cloud
-
-### 1. Push The Project To GitHub
-
-Make sure your repository includes:
-
-- `app.py`
-- `analysis_utils.py`
-- `requirements.txt`
-- `README.md`
-- `tests/test_analysis_utils.py`
-
-Do **not** commit:
-
-- `venv/`
-- `__pycache__/`
-- `.streamlit/secrets.toml`
-
-### 2. Create The App In Streamlit Cloud
-
-1. Go to [share.streamlit.io](https://share.streamlit.io)
-2. Sign in with GitHub
-3. Click **New app**
-4. Select your repository
-5. Choose branch `main`
-6. Set the main file path to `app.py`
-7. Click **Deploy**
-
-### 3. Add Secrets
-
-In the deployed app:
-
-1. Open **Settings**
-2. Open **Secrets**
-3. Add:
-
-   ```toml
-   GROQ_API_KEY = "gsk_..."
-   ```
-
-4. Save and redeploy if needed
-
----
-
 ## Example Test Inputs
 
 ### Copper Tailings Example
@@ -226,8 +158,8 @@ These tests cover:
 
 ## Known Limitations
 
-- The economic summary is still partly narrative and should be treated as indicative
-- Capital and operating cost logic is still screening-level, not engineering-grade
+- The economic summary is partly narrative and should be treated as indicative
+- Capital and operating cost logic is screening-level, not engineering-grade
 - Model output quality can vary between runs
 - The tool assumes user inputs are high-level rather than lab-certified datasets
 

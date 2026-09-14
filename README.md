@@ -1,7 +1,7 @@
 # TailingsValue Pro
 
 **Secondary Resource Recovery Evaluator**  
-Powered by Llama 3.3 70b via Groq · Built with Streamlit
+AI-supported analysis via Groq · Built with Streamlit
 
 ---
 
@@ -15,13 +15,14 @@ TailingsValue Pro is designed as a **preliminary assessment tool** for screening
 
 ## What The App Produces
 
-Given tailings inputs such as source, grades, tonnage, mineralogy, oxidation state, location, infrastructure, and recovery assumption, the app generates:
+Given tailings inputs such as source, grades, tonnage, mineralogy, characterization evidence, oxidation state, location, infrastructure, and a recovery scenario, the app generates:
 
-- Feasibility score out of 100
-- Technical feasibility assessment
-- Recommended processing route
-- Phased action plan
-- Economic summary
+- Screening evidence score out of 100
+- Deterministic mineralogical evidence-readiness assessment
+- Preliminary technical screening narrative
+- Characterization-led comparative testwork strategy
+- Two-phase screening investigation plan
+- Economic value screen and missing-input assessment
 - Gross in-situ value
 - Sensitivity analysis
 
@@ -34,16 +35,19 @@ The app uses a hybrid approach:
 - **Python** handles the structured parts:
   - grade parsing
   - gross in-situ value calculation
-  - recoverable revenue calculation
+  - indicative recovered-metal-value calculation
+  - mineralogical evidence completeness and gap identification
   - sensitivity analysis
   - validation and partial-failure handling
-- **Groq / Llama 3.3 70b** handles the narrative parts:
-  - feasibility explanation
-  - processing route explanation
-  - action plan narrative
+- **Groq / GPT-OSS 120B** handles the narrative parts:
+  - preliminary screening explanation
+  - comparative testwork context
+  - investigation-plan narrative
   - economic interpretation
 
 This makes the app much more reliable than a pure prompt-based implementation while keeping the interface fast and flexible for preliminary screening.
+
+The default model is `openai/gpt-oss-120b`. Scoring uses Groq JSON-schema output, while text renderers normalize common Markdown variations so a model-formatting change does not break the result cards.
 
 ---
 
@@ -58,6 +62,16 @@ This makes the app much more reliable than a pure prompt-based implementation wh
 - Improved rendering of AI output inside structured result cards
 - Streamlit secrets support for the Groq API key
 - Lightweight test coverage for the core parsing and formatting helpers
+
+### Mineralogical Characterization Evidence
+
+The structured mineralogical section records completed analytical methods, modal-mineralogy quality, target-metal deportment, liberation evidence, and spatial sampling coverage. These fields produce an evidence-completeness score and a list of gaps. They do not automatically select a process route or predict recovery.
+
+### Built-In Price References
+
+The built-in screening price set was reviewed on **September 14, 2026**. Copper, lead, nickel, zinc, gold, and silver use [World Bank Pink Sheet](https://www.worldbank.org/en/research/commodity-markets) monthly averages for August 2026, published September 2, 2026. Gold and silver are converted from USD per troy ounce to USD per gram.
+
+Molybdenum and cobalt use 2025 estimates from the [USGS *Mineral Commodity Summaries 2026*](https://pubs.usgs.gov/publication/mcs2026). Lithium uses an elemental-lithium-equivalent proxy derived from the USGS battery-grade lithium carbonate estimate. The aggregate REE value remains a conservative, undifferentiated basket-equivalent screening proxy because an aggregate REE grade has no single defensible market price without element distribution, product basis, specification, and payability.
 
 ---
 
@@ -107,7 +121,7 @@ Mineralogy: chalcopyrite, molybdenite, pyrite, quartz
 Tailings Age & Oxidation State: Fresh / unoxidised (< 5 years)
 Location: Arizona, USA
 Infrastructure Available: existing mill, grid power, water access, tailings dam in place
-Recovery Assumption: 70%
+Uniform Screening Recovery: 70%
 ```
 
 ### Small Gold Tailings Example
@@ -120,7 +134,7 @@ Mineralogy: quartz, iron oxides, clay
 Tailings Age & Oxidation State: Heavily oxidised / supergene (> 20 years)
 Location: Kaduna, Nigeria
 Infrastructure Available: dirt road access only
-Recovery Assumption: 45%
+Uniform Screening Recovery: 45%
 ```
 
 ### Polymetallic Tailings Example
@@ -133,7 +147,7 @@ Mineralogy: chalcopyrite, sphalerite, galena, pyrite, quartz
 Tailings Age & Oxidation State: Partially oxidised (5–20 years)
 Location: Peru
 Infrastructure Available: existing mill, paved road, grid power, water pipeline
-Recovery Assumption: 75%
+Uniform Screening Recovery: 75%
 ```
 
 ---
@@ -158,8 +172,9 @@ These tests cover:
 
 ## Known Limitations
 
-- The economic summary is partly narrative and should be treated as indicative
-- Capital and operating cost logic is screening-level, not engineering-grade
+- The economic output is a value screen, not a profitability or viability conclusion
+- Route selection and recovery prediction require representative characterization and metallurgical testwork
+- CAPEX, OPEX, throughput, payability, and project life are not inferred when absent
 - Model output quality can vary between runs
 - The tool assumes user inputs are high-level rather than lab-certified datasets
 

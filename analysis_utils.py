@@ -69,6 +69,119 @@ def extract_json_object(text: str) -> dict:
     raise json.JSONDecodeError("Incomplete JSON object", text, start)
 
 
+def parse_custom_metal_prices(custom_prices: str, reference_prices: dict) -> tuple:
+    """Apply validated custom-price overrides without mutating the reference set."""
+    prices = {key: dict(value) for key, value in reference_prices.items()}
+    prices_upper = {key.upper(): key for key in prices}
+    errors = []
+    seen = set()
+    segments = [
+        segment.strip()
+        for segment in re.split(r"[,;\n]+", custom_prices)
+        if segment.strip()
+    ]
+    price_pattern = re.compile(r"^([A-Za-z]+)\s*:\s*(\d+(?:\.\d+)?)$")
+
+    for segment in segments:
+        match = price_pattern.fullmatch(segment)
+        if not match:
+            errors.append({"entry": segment, "reason": "Use the format SYMBOL: price"})
+            continue
+
+        symbol_raw, price_raw = match.groups()
+        symbol = symbol_raw.upper()
+        if symbol not in prices_upper:
+            errors.append({"entry": segment, "reason": f"Metal symbol not recognised: {symbol_raw}"})
+            continue
+        if symbol in seen:
+            errors.append({"entry": segment, "reason": f"Duplicate price for {symbol}"})
+            continue
+
+        price = float(price_raw)
+        if price <= 0:
+            errors.append({"entry": segment, "reason": "Price must be greater than zero"})
+            continue
+
+        prices[prices_upper[symbol]]["price"] = price
+        seen.add(symbol)
+
+    return prices, errors
+
+
+def assess_mineralogical_readiness(characterization: dict) -> dict:
+    """Assess characterization evidence completeness without inferring recovery."""
+    methods = [
+        method
+        for method in characterization.get("methods", [])
+        if method != "Not provided"
+    ]
+    modal = characterization.get("modal_mineralogy", "Not provided")
+    deportment = characterization.get("metal_deportment", "Not provided")
+    liberation = characterization.get("liberation", "Not provided")
+    spatial = characterization.get("spatial_coverage", "Not provided")
+
+    dimension_scores = {
+        "methods": min(len(methods) / 2, 1.0),
+        "modal_mineralogy": {
+            "Not provided": 0.0,
+            "Qualitative mineral identification": 0.5,
+            "Quantitative modal mineralogy": 1.0,
+        }.get(modal, 0.0),
+        "metal_deportment": {
+            "Not provided": 0.0,
+            "Inferred from mineral names": 0.25,
+            "Target-metal hosts identified": 0.65,
+            "Quantitative deportment measured": 1.0,
+        }.get(deportment, 0.0),
+        "liberation": {
+            "Not provided": 0.0,
+            "Qualitative observations": 0.4,
+            "Measured by size fraction": 1.0,
+        }.get(liberation, 0.0),
+        "spatial_coverage": {
+            "Not provided": 0.0,
+            "Single sample": 0.25,
+            "Multiple locations or depths": 0.65,
+            "Representative spatial programme": 1.0,
+        }.get(spatial, 0.0),
+    }
+    score = round(sum(dimension_scores.values()) / len(dimension_scores) * 100)
+
+    gaps = []
+    next_steps = []
+    if not methods:
+        gaps.append("No analytical characterization method is reported.")
+        next_steps.append("Record the analytical methods used and their detection or reporting limits.")
+    if modal != "Quantitative modal mineralogy":
+        gaps.append("Quantitative modal mineral abundances are not available.")
+        next_steps.append("Obtain quantitative mineralogy appropriate to the material and target phases.")
+    if deportment != "Quantitative deportment measured":
+        gaps.append("Target-metal deportment among mineral phases is not quantified.")
+        next_steps.append("Measure target-metal deportment rather than inferring hosts from mineral names.")
+    if liberation != "Measured by size fraction":
+        gaps.append("Liberation and locking are not measured by particle-size fraction.")
+        next_steps.append("Characterize liberation, associations, and locking across relevant size fractions.")
+    if spatial != "Representative spatial programme":
+        gaps.append("Spatial variability and sampling representativeness are not demonstrated.")
+        next_steps.append("Design representative sampling across locations, depths, and material domains.")
+
+    if score >= 80:
+        status = "Strong characterization evidence"
+    elif score >= 50:
+        status = "Partial characterization evidence"
+    else:
+        status = "Initial characterization evidence"
+
+    return {
+        "score": score,
+        "sub_score": max(1, min(5, (score + 19) // 20)),
+        "status": status,
+        "methods": methods,
+        "gaps": gaps,
+        "next_steps": next_steps,
+    }
+
+
 def parse_gross_value_from_grades(grades_text: str, tonnage: float, prices: dict) -> tuple:
     """
     Python calculation of gross in-situ value.
@@ -184,16 +297,48 @@ def is_price_reference_stale(reference_date_iso: str, max_age_days: int = 90, to
 
 def calculate_economic_snapshot(gross_value: float, recovery_pct: int, tonnage: float) -> dict:
     """
-    Deterministic economic snapshot used both in the UI and in the model prompt.
+    Deterministic value snapshot used both in the UI and in the model prompt.
+
+    Throughput and project life are not inferred because both require project-
+    specific inputs. The recovery percentage remains a screening scenario.
     """
     estimated_revenue = gross_value * (recovery_pct / 100)
-    annual_processing_rate = min(int(tonnage), 1_000_000) if tonnage > 0 else 0
-    project_life_years = (tonnage / annual_processing_rate) if annual_processing_rate else 0
+    recoverable_value_per_tonne = estimated_revenue / tonnage if tonnage else 0
     return {
         "estimated_revenue": estimated_revenue,
-        "annual_processing_rate": annual_processing_rate,
-        "project_life_years": project_life_years,
+        "recoverable_value_per_tonne": recoverable_value_per_tonne,
     }
+
+
+def missing_action_plan_phases(text: str) -> list[int]:
+    """Return required action-plan phases that are absent from model output."""
+    normalized = normalize_model_text(text, mode="action_plan")
+    present = {
+        int(match)
+        for match in re.findall(r"(?im)^\s*Phase\s+([1-2])\s*:", normalized)
+    }
+    return [phase for phase in range(1, 3) if phase not in present]
+
+
+def action_plan_validation_issues(text: str) -> list[str]:
+    """Return structural issues that make the two-phase screening plan incomplete."""
+    normalized = normalize_model_text(text, mode="action_plan")
+    issues = [f"missing Phase {phase}" for phase in missing_action_plan_phases(normalized)]
+    for phase in range(1, 3):
+        phase_match = re.search(
+            rf"(?ims)^\s*Phase\s+{phase}\s*:.*?(?=^\s*Phase\s+[1-2]\s*:|\Z)",
+            normalized,
+        )
+        if not phase_match:
+            continue
+        section = phase_match.group(0)
+        if not re.search(r"(?im)^\s*Key activities\s*:", section):
+            issues.append(f"Phase {phase} missing Key activities")
+        if not re.search(r"(?im)^\s*Key deliverables\s*:", section):
+            issues.append(f"Phase {phase} missing Key deliverables")
+        if not re.search(rf"(?im)^\s*Decision Gate {phase}\s*:", section):
+            issues.append(f"Phase {phase} missing Decision Gate {phase}")
+    return issues
 
 
 def normalize_model_text(text: str, mode: str = "generic") -> str:
@@ -201,19 +346,50 @@ def normalize_model_text(text: str, mode: str = "generic") -> str:
     Clean up common model output patterns before rendering.
     """
     text = text.replace("\r\n", "\n").strip()
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*-{3,}\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"(?m)^\s*\*\*(Phase\s+[1-2]\s*:[^*]+|Key activities:|Key deliverables:|Decision Gate\s+[1-2]:[^*]+)\*\*\s*$",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
 
     if mode == "processing_route":
         labels = [
+            "SCREENING STRATEGY:",
             "RECOMMENDED ROUTE:",
             "RATIONALE:",
+            "CANDIDATE TESTS:",
             "EXPECTED RECOVERY:",
+            "ROUTE SELECTION STATUS:",
             "ALTERNATIVES REJECTED:",
         ]
+        for label in labels:
+            text = re.sub(
+                rf"\*\*\s*{re.escape(label[:-1])}\s*:\s*\*\*",
+                label,
+                text,
+                flags=re.IGNORECASE,
+            )
         for label in labels[1:]:
             text = text.replace(f" {label}", f"\n{label}")
             text = text.replace(label, f"\n{label}")
         text = text.lstrip()
     elif mode == "action_plan":
+        phase_names = r"Investigation\s*&\s*Sampling|Mineralogical\s+Characterization\s*&\s*Testwork"
+        text = re.sub(
+            rf"(?m)^\s*([1-2])\.\s+((?:{phase_names})[^\n]*)$",
+            r"Phase \1: \2",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            rf"\s+([1-2])\.\s+((?:{phase_names}))",
+            r"\nPhase \1: \2",
+            text,
+            flags=re.IGNORECASE,
+        )
         text = re.sub(r"\s+\+\s+", "\n- ", text)
         text = re.sub(r"\s*[*-]\s*(Key activities:)", r"\n\1", text)
         text = re.sub(r"\s*[*-]\s*(Key deliverables:)", r"\n\1", text)
@@ -238,6 +414,7 @@ def _format_inline(text: str) -> str:
     text = escape(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", text)
     return text
 
 
@@ -340,7 +517,7 @@ def render_key_value_sections(text: str, labels: list[str]) -> str:
         section = text[start:end].strip()
         content = section[len(label):].strip()
         html_parts.append(f'<div class="structured-block"><div class="structured-label">{escape(label.rstrip(":"))}</div>')
-        if label == "ALTERNATIVES REJECTED:":
+        if label in {"CANDIDATE TESTS:", "ALTERNATIVES REJECTED:"}:
             lines = [line.strip() for line in content.split("\n") if line.strip()]
             bullets = []
             paragraph = []

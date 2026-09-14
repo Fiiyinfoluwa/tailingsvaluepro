@@ -1,14 +1,19 @@
 import json
+import os
 import time
 from datetime import date, datetime
 import streamlit as st
 from groq import Groq
+from streamlit.errors import StreamlitSecretNotFoundError
 from concurrent.futures import ThreadPoolExecutor
 from analysis_utils import (
+    action_plan_validation_issues,
+    assess_mineralogical_readiness,
     calculate_economic_snapshot,
     calculate_sensitivity,
     extract_json_object,
     is_price_reference_stale,
+    parse_custom_metal_prices,
     parse_gross_value_from_grades,
     render_action_plan_html,
     render_key_value_sections,
@@ -17,6 +22,18 @@ from analysis_utils import (
 )
 
 RUN_COOLDOWN_SECONDS = 8
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+
+
+def get_app_setting(name: str, default=None):
+    """Read configuration without requiring a local Streamlit secrets file."""
+    environment_value = os.getenv(name)
+    if environment_value:
+        return environment_value
+    try:
+        return st.secrets.get(name, default)
+    except StreamlitSecretNotFoundError:
+        return default
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -284,110 +301,134 @@ footer {
 
 # ── Metal price reference table ─────────────────────────────────────────────────
 METAL_PRICES = {
-    "Cu":  {"price": 9200,    "unit": "USD/t",   "name": "Copper"},
-    "Au":  {"price": 65,      "unit": "USD/g",   "name": "Gold"},
-    "Ag":  {"price": 0.85,    "unit": "USD/g",   "name": "Silver"},
-    "Mo":  {"price": 55000,   "unit": "USD/t",   "name": "Molybdenum"},
-    "Zn":  {"price": 2800,    "unit": "USD/t",   "name": "Zinc"},
-    "Pb":  {"price": 2100,    "unit": "USD/t",   "name": "Lead"},
-    "Ni":  {"price": 16500,   "unit": "USD/t",   "name": "Nickel"},
-    "Co":  {"price": 33000,   "unit": "USD/t",   "name": "Cobalt"},
-    "Li":  {"price": 13000,   "unit": "USD/t",   "name": "Lithium"},
-    "REE": {"price": 2500,    "unit": "USD/t",   "name": "Rare Earth Elements"},
+    "Cu":  {"price": 14326,   "unit": "USD/t",   "name": "Copper"},
+    "Au":  {"price": 141.82,  "unit": "USD/g",   "name": "Gold"},
+    "Ag":  {"price": 2.10,    "unit": "USD/g",   "name": "Silver"},
+    "Mo":  {"price": 51000,   "unit": "USD/t",   "name": "Molybdenum"},
+    "Zn":  {"price": 3875,    "unit": "USD/t",   "name": "Zinc"},
+    "Pb":  {"price": 1855,    "unit": "USD/t",   "name": "Lead"},
+    "Ni":  {"price": 16751,   "unit": "USD/t",   "name": "Nickel"},
+    "Co":  {"price": 33069,   "unit": "USD/t",   "name": "Cobalt"},
+    "Li":  {
+        "price": 47900,
+        "unit": "USD/t",
+        "name": "Lithium",
+        "basis": "elemental Li-equivalent proxy derived from battery-grade lithium carbonate",
+    },
+    "REE": {
+        "price": 2500,
+        "unit": "USD/t",
+        "name": "Rare Earth Elements",
+        "basis": "conservative undifferentiated basket-equivalent screening proxy",
+    },
 }
 
-PRICE_REF_DATE = "2026-03-01"
+PRICE_REF_DATE = "2026-09-14"
+PRICE_OBSERVATION_LABEL = (
+    "August 2026 monthly averages for Cu, Pb, Ni, Zn, Au and Ag; "
+    "2025 USGS estimates for Mo, Co and Li; conservative REE proxy"
+)
+PRICE_SOURCE_LABEL = "World Bank Pink Sheet and USGS Mineral Commodity Summaries 2026"
 
-# ── Feasibility scoring rubric ──────────────────────────────────────────────────
+# ── Screening-evidence rubric ───────────────────────────────────────────────────
 SCORE_RUBRIC = {
     "grade": {
-        "label": "Grade Quality",
+        "label": "Grade Evidence",
         "weight": 0.30,
         "criteria": (
-            "1 = sub-economic at current prices, no viable recovery route\n"
-            "2 = marginal — borderline economic, high sensitivity to price\n"
-            "3 = low but potentially economic with efficient low-OPEX processing\n"
-            "4 = economic with standard processing at current prices\n"
-            "5 = strong grade, clearly economic across a range of prices"
+            "1 = no usable quantitative grade data\n"
+            "2 = numerical grades with no sampling or QA/QC support stated\n"
+            "3 = grades supported by representative sampling information\n"
+            "4 = QA/QC-supported grades with spatial variability characterised\n"
+            "5 = independently verified grade model suitable for advanced study"
         ),
     },
     "tonnage": {
-        "label": "Tonnage Scale",
+        "label": "Inventory Evidence",
         "weight": 0.20,
         "criteria": (
-            "1 = < 500,000 t\n"
-            "2 = 500,000 – 2 million t\n"
-            "3 = 2 – 10 million t\n"
-            "4 = 10 – 50 million t\n"
-            "5 = > 50 million t"
+            "1 = no usable tonnage estimate\n"
+            "2 = numerical inventory stated with no estimation method or density support\n"
+            "3 = surveyed volume or sampling basis described\n"
+            "4 = representative drilling and density model reported\n"
+            "5 = independently verified inventory estimate suitable for advanced study"
         ),
     },
     "mineralogy": {
-        "label": "Mineralogy & Processability",
+        "label": "Mineralogical Evidence",
         "weight": 0.20,
         "criteria": (
-            "1 = complex mixed oxides/sulfides, refractory, penalty elements\n"
-            "2 = moderately complex — mixed or partially refractory\n"
-            "3 = moderate complexity — some gangue complications\n"
-            "4 = relatively simple — primary sulfides, well-understood processing\n"
-            "5 = simple — single dominant mineral, standard processing applies"
+            "Deterministically calculated from analytical methods, quantitative modal mineralogy, "
+            "metal deportment, liberation evidence, and spatial representativeness."
         ),
     },
     "infrastructure": {
-        "label": "Infrastructure",
+        "label": "Infrastructure Evidence",
         "weight": 0.20,
         "criteria": (
-            "1 = remote, no existing infrastructure\n"
-            "2 = minimal — only power or only water available\n"
-            "3 = partial — some infrastructure present\n"
-            "4 = good — mill or major processing equipment available\n"
-            "5 = excellent — existing mill + grid power + water access"
+            "1 = no infrastructure information\n"
+            "2 = assets listed without capacity, condition, availability, or compatibility evidence\n"
+            "3 = some asset capacity or condition information supplied\n"
+            "4 = engineering review indicates adequate capacity and compatibility\n"
+            "5 = verified infrastructure demonstrated suitable for the candidate process"
         ),
     },
     "oxidation": {
-        "label": "Oxidation State",
+        "label": "Material Condition Evidence",
         "weight": 0.10,
         "criteria": (
-            "1 = heavily oxidised/supergene — complex processing, low recoveries\n"
-            "2 = significantly oxidised — additional treatment required\n"
-            "3 = partially oxidised — mixed processing requirements\n"
-            "4 = mostly fresh — minor oxidation impact\n"
-            "5 = fresh/unoxidised — standard processing, best recoveries"
+            "1 = material condition or oxidation state unknown\n"
+            "2 = broad age or oxidation category stated without analytical verification\n"
+            "3 = analytical confirmation supplied for selected samples\n"
+            "4 = representative spatial variability in material condition characterised\n"
+            "5 = material-condition evidence linked to validated recovery performance"
         ),
     },
 }
 
 # ── Groq API calls ────────────────────────────────────────────────────────────
-def call_groq(client: Groq, system: str, user: str) -> str:
+def call_groq(
+    client: Groq,
+    system: str,
+    user: str,
+    max_tokens: int = 1500,
+    response_format: dict | None = None,
+) -> str:
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
+        request = {
+            "model": GROQ_MODEL,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=1500,
-            temperature=0.3,
-        )
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+            "reasoning_effort": "low",
+        }
+        if response_format:
+            request["response_format"] = response_format
+        response = client.chat.completions.create(**request)
         return response.choices[0].message.content.strip()
     except Exception as exc:
         raise RuntimeError(f"Groq API error: {exc}") from exc
 
 
-def get_feasibility_score(client, inputs: dict) -> tuple:
+def get_feasibility_score(client, inputs: dict, mineral_readiness: dict) -> tuple:
     criteria_block = "\n\n".join(
         f'{key.upper()} ({info["label"]}, weight {int(info["weight"] * 100)}%):\n{info["criteria"]}'
         for key, info in SCORE_RUBRIC.items()
+        if key != "mineralogy"
     )
-    system = """You are a senior mining engineer scoring tailings reprocessing feasibility.
-Score each factor using ONLY the exact band criteria provided. Output valid JSON only — no other text."""
-    user = f"""Score these tailings. Output a JSON object with exactly these keys: grade, tonnage, mineralogy, infrastructure, oxidation. Each value must be an integer 1–5.
+    system = """You are scoring the readiness of evidence supplied for preliminary tailings screening.
+This is not a feasibility, profitability, or recovery score. Score each requested factor only from the exact evidence criteria."""
+    user = f"""Score these tailings. Return grade, tonnage, infrastructure, and oxidation as integers from 1 to 5.
 
 TAILINGS:
 - Source: {inputs['source']}
 - Grades: {inputs['grades']}
 - Tonnage: {inputs['tonnage']:,} tonnes
 - Mineralogy: {inputs['mineralogy']}
+- Mineralogical characterization: {inputs['mineral_characterization']}
 - Oxidation state: {inputs['oxidation']}
 - Location: {inputs['location']}
 - Infrastructure: {inputs['infrastructure']}
@@ -395,97 +436,150 @@ TAILINGS:
 SCORING CRITERIA:
 {criteria_block}
 
-Example output: {{"grade": 3, "tonnage": 4, "mineralogy": 3, "infrastructure": 5, "oxidation": 4}}
-Output ONLY the JSON object. No explanation."""
-    result = call_groq(client, system, user)
+Mineralogy is scored separately by deterministic evidence checks and must not be returned."""
+    score_keys = ["grade", "tonnage", "infrastructure", "oxidation"]
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "screening_evidence_scores",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    key: {"type": "integer"}
+                    for key in score_keys
+                },
+                "required": score_keys,
+                "additionalProperties": False,
+            },
+        },
+    }
+    result = call_groq(client, system, user, response_format=response_format)
     try:
         sub_scores = extract_json_object(result)
-        for key in SCORE_RUBRIC:
-            sub_scores[key] = max(1, min(5, int(sub_scores.get(key, 3))))
+        for key in score_keys:
+            sub_scores[key] = max(1, min(5, int(sub_scores[key])))
+        sub_scores["mineralogy"] = mineral_readiness["sub_score"]
         weighted = sum(sub_scores[k] * SCORE_RUBRIC[k]["weight"] for k in SCORE_RUBRIC)
         score = round(weighted * 20)
         return score, sub_scores, False
-    except (ValueError, TypeError, json.JSONDecodeError):
-        fallback = {k: 3 for k in SCORE_RUBRIC}
-        return 60, fallback, True
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        fallback = {k: 2 for k in SCORE_RUBRIC}
+        fallback["mineralogy"] = mineral_readiness["sub_score"]
+        return 0, fallback, True
 
 
-def get_feasibility_report(client, inputs: dict, metal_prices_text: str) -> str:
-    system = """You are a senior mining engineer and metallurgist specialising in tailings reprocessing.
-Write a clear, structured technical feasibility assessment. Use headings. Be specific.
-Do not hallucinate grades or figures — only use values provided by the user.
-Flag any missing data that would affect the assessment."""
-    user = f"""Write a technical feasibility assessment for secondary metal recovery from these tailings:
+def get_feasibility_report(
+    client,
+    inputs: dict,
+    metal_prices_text: str,
+    gross_value: float,
+    estimated_recovered_value: float,
+    recovery_pct: int,
+) -> str:
+    system = """You are a senior mining engineer and mineralogist writing a preliminary screening assessment.
+Use only entered facts and fixed calculations. A mineral name establishes reported presence only; it does not establish
+abundance, target-metal hosting, deportment, liberation, locking, recovery, or process suitability. Treat missing or
+unverified information as unknown, not absent. Describe process methods as test candidates and never classify the
+project as feasible, viable, profitable, or technically proven. Use Markdown headings and hyphen bullets only. Do not
+use tables, HTML, LaTeX, bold-only headings, or horizontal rules. Keep the response under 550 words."""
+    user = f"""Write a preliminary screening assessment for secondary metal recovery from these tailings:
 
 INPUTS:
 - Source: {inputs['source']}
 - Metal grades: {inputs['grades']}
 - Tonnage: {inputs['tonnage']:,} tonnes
 - Mineralogy: {inputs['mineralogy']}
+- Mineralogical characterization: {inputs['mineral_characterization']}
+- Mineralogical evidence status: {inputs['mineral_readiness_summary']}
 - Oxidation state: {inputs['oxidation']}
 - Location: {inputs['location']}
 - Infrastructure: {inputs['infrastructure']}
 - Metal prices used: {metal_prices_text}
+- Gross in-situ value calculated from entered grades, tonnage, and prices: USD {gross_value:,.0f}
+- Selected uniform recovery scenario, not testwork-validated: {recovery_pct}%
+- Indicative recovered metal value: USD {estimated_recovered_value:,.0f}
 
 STRUCTURE YOUR REPORT:
-1. Grade Assessment — evaluate whether grades are economic
-2. Mineralogy & Processing Implications — how mineralogy affects recovery options
-3. Oxidation State Impact — how oxidation state affects the recommended process route
-4. Infrastructure Assessment — what existing infrastructure reduces CAPEX/OPEX
-5. Key Risks — list 3-4 specific technical or economic risks
-6. Overall Verdict — one paragraph summary
+## Grade and Value Screen
+## Mineralogical Evidence
+## Characterization Gaps
+## Candidate Testwork
+## Infrastructure Evidence
+## Screening Summary
 
-Be direct. Use bullet points where appropriate."""
+Do not invent external grade thresholds, mineral proportions, recoveries, costs, or infrastructure benefits."""
     return call_groq(client, system, user)
 
 
-def get_processing_route(client, inputs: dict) -> str:
+def get_processing_strategy(client, inputs: dict, recovery_pct: int) -> str:
     system = """You are a metallurgist specialising in tailings reprocessing.
-Recommend a specific processing route. Always include:
-- Primary recommended route with rationale
-- Why 1-2 alternative routes were rejected (contraindications)
-- Expected recovery range (%)
-Be specific to the mineralogy and oxidation state provided."""
-    user = f"""Recommend a processing route for:
+Provide an evidence-first characterization and comparative-testwork strategy, not a selected plant design. Do not
+infer target-metal hosts, mineral abundance, liberation, locking, recovery, route suitability, or reagent demand from
+mineral names or a broad oxidation category. Use the exact labels requested, plain text, and hyphen bullets. Do not use
+Markdown emphasis, tables, HTML, LaTeX, or horizontal rules. Keep the response under 350 words."""
+    user = f"""Prepare a screening testwork strategy for:
 
 Source: {inputs['source']}
 Grades: {inputs['grades']}
 Mineralogy: {inputs['mineralogy']}
+Mineralogical characterization: {inputs['mineral_characterization']}
+Evidence gaps: {inputs['mineral_readiness_summary']}
 Oxidation state: {inputs['oxidation']}
 Infrastructure available: {inputs['infrastructure']}
 Location: {inputs['location']}
+Selected uniform recovery scenario: {recovery_pct}% (not a testwork result)
 
 Format:
-RECOMMENDED ROUTE: [name]
-RATIONALE: [why this route suits the mineralogy/oxidation state]
-EXPECTED RECOVERY: [range %]
-ALTERNATIVES REJECTED:
-- [Route A]: [why not suitable]
-- [Route B]: [why not suitable]"""
+SCREENING STRATEGY: Characterization-led comparative testwork
+RATIONALE: [explain why unresolved evidence prevents route selection]
+CANDIDATE TESTS:
+- [test and the uncertainty it addresses]
+ROUTE SELECTION STATUS: Deferred until representative characterization and metallurgical testwork are complete."""
     return call_groq(client, system, user)
 
 
 def get_action_plan(client, inputs: dict) -> str:
     system = """You are a mining project development consultant.
-Write a phased action plan for developing a tailings reprocessing project.
-Be specific about durations, key deliverables, and decision gates."""
-    user = f"""Write a phased action plan for reprocessing these tailings:
+Write a concise two-phase screening investigation plan. Do not extend into feasibility engineering, permitting,
+finance, construction, or production because this tool only screens whether further investigation is justified.
+Do not invent sample masses, recovery thresholds, costs, plant capacities, or test results. Use every requested label
+exactly, plain text and hyphen bullets only. Do not use Markdown emphasis, tables, HTML, LaTeX, or horizontal rules."""
+    user = f"""Write a two-phase screening investigation plan for these tailings:
 
 Source: {inputs['source']}
 Tonnage: {inputs['tonnage']:,} tonnes
 Location: {inputs['location']}
 Infrastructure: {inputs['infrastructure']}
+Mineralogical characterization: {inputs['mineral_characterization']}
+Current evidence gaps: {inputs['mineral_readiness_summary']}
 
-Phases:
-1. Investigation & Sampling (months + key activities)
-2. Metallurgical Testwork (months + key activities)
-3. Feasibility Study (months + key activities)
-4. Permitting & Finance (months + key activities)
-5. Construction & Commissioning (months + key activities)
-6. Production
+Use this exact structure for both phases:
+Phase 1: Investigation & Sampling (duration estimate)
+Key activities:
+- activity
+Key deliverables:
+- deliverable
+Decision Gate 1: evidence-based criterion for proceeding
 
-Include key decision gates between phases."""
-    return call_groq(client, system, user)
+Phase 2: Mineralogical Characterization & Testwork (duration estimate)
+Key activities:
+- activity
+Key deliverables:
+- deliverable
+Decision Gate 2: decide whether the evidence justifies a separate feasibility study
+
+End with: SCOPE LIMIT: Later project-development phases are outside this screening tool."""
+    result = call_groq(client, system, user, max_tokens=1800)
+    issues = action_plan_validation_issues(result)
+    if not issues:
+        return result
+    retry = user + "\n\nCorrect these structural problems: " + "; ".join(issues)
+    result = call_groq(client, system, retry, max_tokens=1800)
+    issues = action_plan_validation_issues(result)
+    if issues:
+        raise RuntimeError("The generated screening plan remained incomplete after retrying: " + "; ".join(issues))
+    return result
 
 
 def get_economic_summary(
@@ -495,12 +589,14 @@ def get_economic_summary(
     estimated_revenue: float,
     recovery_pct: int,
     metal_prices_text: str,
-    annual_processing_rate: int,
-    project_life_years: float,
 ) -> str:
-    system = """You are a mining economist specialising in tailings reprocessing projects.
-Be realistic and conservative. Never compress multi-year cashflows into a single-year payback calculation."""
-    user = f"""Provide an economic summary for this tailings reprocessing project.
+    system = """You are a mining economist specialising in preliminary tailings screening.
+Interpret only fixed values calculated from entered inputs. Do not estimate CAPEX, OPEX, throughput, project life,
+cash flow, payback, NPV, IRR, or economic viability when those inputs are absent. Gross and recovered metal value are
+not revenue, income, cash flow, or profit. Use short Markdown headings and hyphen bullets only. Do not use tables,
+HTML, LaTeX, bold-only headings, or horizontal rules. Keep the response under 300 words."""
+    recoverable_value_per_tonne = estimated_revenue / inputs["tonnage"] if inputs["tonnage"] else 0
+    user = f"""Provide an economic screening interpretation for this tailings project.
 
 INPUTS:
 - Source: {inputs['source']}
@@ -509,29 +605,19 @@ INPUTS:
 - Location: {inputs['location']}
 - Infrastructure available: {inputs['infrastructure']}
 - Metal prices used: {metal_prices_text}
-- Gross in-situ metal value (Python-calculated): USD {gross_value:,.0f}
-- Recovery factor (user-set): {recovery_pct}%
-- Estimated recoverable revenue (Python-calculated): USD {estimated_revenue:,.0f}
-- Annual processing rate assumption (Python-calculated): {annual_processing_rate:,.0f} tonnes/year
-- Project life (Python-calculated): {project_life_years:.1f} years
+- Gross in-situ metal value calculated from entered inputs: USD {gross_value:,.0f}
+- Selected uniform recovery scenario, not testwork-validated: {recovery_pct}%
+- Indicative recovered metal value: USD {estimated_revenue:,.0f}
+- Indicative recovered metal value per tonne: USD {recoverable_value_per_tonne:,.2f}/t
+- Throughput, project life, CAPEX, OPEX, payability, and commercial terms: not provided
 
-RULES — follow exactly:
-- Do NOT recalculate gross in-situ value or estimated revenue. Both are fixed inputs above.
-- Do NOT choose a different recovery factor. The user has set it at {recovery_pct}%.
-- Do NOT choose a different annual processing rate or project life. Use {annual_processing_rate:,.0f} tonnes/year and {project_life_years:.1f} years exactly.
-- For payback: use the fixed annual processing rate above, then calculate simple payback = net CAPEX / annual net cash flow. Show each step.
-- Payback must be expressed in years against the stated project life — not compressed into months.
+Use exactly these headings:
+## Value Screen
+## Missing Economic Inputs
+## Assessment Limit
 
-PROVIDE:
-1. CAPEX estimate range — show infrastructure credit applied and net CAPEX
-2. OPEX estimate (USD/tonne processed) with brief justification
-3. Estimated total revenue: USD {estimated_revenue:,.0f} (at {recovery_pct}% recovery — already calculated, confirm and use)
-4. Annual processing rate assumption and derived project life (years): confirm {annual_processing_rate:,.0f} tonnes/year and {project_life_years:.1f} years
-5. Annual net cash flow (annual revenue minus annual OPEX)
-6. Simple payback period = net CAPEX / annual net cash flow (in years)
-7. Economic verdict: viable / marginal / not viable — one sentence with the key reason
-
-IMPORTANT: Write all dollar amounts as e.g. "USD 23 million" or "23M USD" — do NOT use the $ symbol as it breaks rendering."""
+State that a techno-economic viability conclusion is not available until the missing inputs are supplied. If multiple
+metals are listed, note that one uniform recovery factor is only a simplifying scenario."""
     return call_groq(client, system, user)
 
 
@@ -559,16 +645,17 @@ def render_output_card(title: str, body_html: str):
 st.markdown("""
 <div class="hero">
   <h1>⛏ TailingsValue Pro</h1>
-  <p>Secondary Resource Recovery Evaluator · Powered by Llama 3.3 70b via Groq</p>
+  <p>Preliminary Tailings Screener · Mineralogical evidence and value scenarios</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ── Secrets setup ────────────────────────────────────────────────────────────────
-api_key = st.secrets.get("GROQ_API_KEY")
+api_key = get_app_setting("GROQ_API_KEY")
+GROQ_MODEL = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
 if not api_key:
     st.markdown("""
     <div class="warning-box">
-        GROQ_API_KEY is not configured in Streamlit secrets. Add it before sharing this demo.
+        GROQ_API_KEY is not configured in Streamlit secrets or the environment. AI-supported analysis is unavailable.
     </div>
     """, unsafe_allow_html=True)
 
@@ -599,6 +686,7 @@ with col1:
         "Mineralogy",
         placeholder="e.g. chalcopyrite, molybdenite, pyrite, quartz",
         height=80,
+        help="List reported minerals only. Use the structured section below for analytical evidence.",
     )
 
 with col2:
@@ -619,18 +707,90 @@ with col2:
         "Infrastructure Available",
         placeholder="e.g. existing mill, grid power, water access, tailings dam in place",
         height=80,
-        help="Infrastructure strongly affects CAPEX, OPEX, and the feasibility score. Include any existing mill, power, water, roads, permits, or tailings facilities if known.",
+        help="List known assets and include capacity, condition, availability, or compatibility evidence where available.",
     )
 
     if not infrastructure:
         st.markdown("""
         <div class="warning-box" style="margin-top:0.4rem;">
-            Infrastructure is optional, but leaving it blank reduces confidence in the economic summary and feasibility score.
+            Infrastructure is optional, but leaving it blank limits the infrastructure evidence assessment.
         </div>
         """, unsafe_allow_html=True)
 
+# Structured characterization evidence supplements the free-text mineral list.
+with st.expander("Mineralogical Characterization Evidence", expanded=True):
+    st.caption(
+        "Enter only evidence that is already available. Mineral names alone do not establish "
+        "abundance, metal hosting, liberation, or recoverability."
+    )
+    mineral_col1, mineral_col2 = st.columns(2)
+    with mineral_col1:
+        characterization_methods = st.multiselect(
+            "Methods used",
+            options=[
+                "XRD",
+                "SEM-EDS",
+                "QEMSCAN / MLA",
+                "Hyperspectral imaging",
+                "Bulk chemical assay",
+                "Other documented method",
+            ],
+            help="Select completed analytical methods, not planned work.",
+        )
+        modal_mineralogy = st.selectbox(
+            "Modal mineralogy",
+            options=[
+                "Not provided",
+                "Qualitative mineral identification",
+                "Quantitative modal mineralogy",
+            ],
+        )
+        metal_deportment = st.selectbox(
+            "Target-metal host and deportment",
+            options=[
+                "Not provided",
+                "Inferred from mineral names",
+                "Target-metal hosts identified",
+                "Quantitative deportment measured",
+            ],
+        )
+    with mineral_col2:
+        liberation = st.selectbox(
+            "Liberation and locking evidence",
+            options=[
+                "Not provided",
+                "Qualitative observations",
+                "Measured by size fraction",
+            ],
+        )
+        spatial_coverage = st.selectbox(
+            "Sampling coverage",
+            options=[
+                "Not provided",
+                "Single sample",
+                "Multiple locations or depths",
+                "Representative spatial programme",
+            ],
+        )
+        characterization_notes = st.text_area(
+            "Characterization notes",
+            placeholder="e.g. method, sample coverage, modal %, host phases, liberation size",
+            height=96,
+        )
+
+mineral_characterization = {
+    "methods": characterization_methods,
+    "modal_mineralogy": modal_mineralogy,
+    "metal_deportment": metal_deportment,
+    "liberation": liberation,
+    "spatial_coverage": spatial_coverage,
+    "notes": characterization_notes.strip(),
+}
+mineral_readiness = assess_mineralogical_readiness(mineral_characterization)
+
 # Metal prices
 st.markdown('<div class="section-label">Metal Prices</div>', unsafe_allow_html=True)
+custom_price_errors = []
 price_mode = st.radio(
     "Price source",
     options=["Use reference prices (built-in)", "Enter custom prices"],
@@ -644,54 +804,54 @@ if price_mode == "Enter custom prices":
         placeholder="e.g. Cu: 9500, Au: 70, Mo: 60000  (USD/t for base metals, USD/g for Au/Ag)"
     )
     metal_prices_text = f"Custom prices entered: {custom_prices}"
-    # Parse custom prices into prices_used so Python calc uses them
-    prices_used = dict(METAL_PRICES)  # start from reference, override with custom
-    if custom_prices:
-        # Build reverse map: uppercase key -> original key
-        upper_to_key = {k.upper(): k for k in prices_used}
-        for match in re.finditer(r'([A-Za-z]+)\s*:\s*([\d.]+)', custom_prices):
-            symbol_upper = match.group(1).upper()
-            price_val = float(match.group(2))
-            if symbol_upper in upper_to_key:
-                orig_key = upper_to_key[symbol_upper]
-                prices_used[orig_key] = dict(prices_used[orig_key])
-                prices_used[orig_key]["price"] = price_val
+    prices_used, custom_price_errors = parse_custom_metal_prices(custom_prices, METAL_PRICES)
 else:
     price_ref_stale, price_ref_age_days = is_price_reference_stale(
         PRICE_REF_DATE,
         today=date.today(),
     )
-    price_ref_label = datetime.fromisoformat(PRICE_REF_DATE).strftime("%B %Y")
-    price_table = " | ".join([f"{m}: {v['price']} {v['unit']}" for m, v in METAL_PRICES.items()])
+    price_ref_label = datetime.fromisoformat(PRICE_REF_DATE).strftime("%B %d, %Y")
+    price_table = " | ".join(
+        f"{m}: {v['price']} {v['unit']}" + (f" ({v['basis']})" if v.get("basis") else "")
+        for m, v in METAL_PRICES.items()
+    )
     if price_ref_stale:
         st.markdown(
-            f'<div class="warning-box">Reference prices last updated {price_ref_label} '
-            f'({price_ref_age_days} days old). Review and refresh before using them for decision-making: {price_table}</div>',
+            f'<div class="warning-box">Reference price set last reviewed {price_ref_label} '
+            f'({price_ref_age_days} days old). Review before decision-making. Basis: {PRICE_OBSERVATION_LABEL}. '
+            f'Source: {PRICE_SOURCE_LABEL}.<br>{price_table}</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            f'<div class="warning-box">Reference prices last updated {price_ref_label} '
-            f'({price_ref_age_days} days old): {price_table}</div>',
+            f'<div class="warning-box">Reference price set last reviewed {price_ref_label} '
+            f'({price_ref_age_days} days old). Basis: {PRICE_OBSERVATION_LABEL}. '
+            f'Source: {PRICE_SOURCE_LABEL}.<br>{price_table}</div>',
             unsafe_allow_html=True,
         )
-    metal_prices_text = f"Reference prices as of {price_ref_label}: " + ", ".join([f"{v['name']}: {v['price']} {v['unit']}" for v in METAL_PRICES.values()])
+    metal_prices_text = (
+        f"Reference set reviewed {price_ref_label}; basis: {PRICE_OBSERVATION_LABEL}; "
+        f"source: {PRICE_SOURCE_LABEL}: "
+    ) + ", ".join(
+        f"{v['name']}: {v['price']} {v['unit']}" + (f" ({v['basis']})" if v.get("basis") else "")
+        for v in METAL_PRICES.values()
+    )
     prices_used = METAL_PRICES
 
-# ── Recovery assumption ─────────────────────────────────────────────────────────
-st.markdown('<div class="section-label">Recovery Assumption</div>', unsafe_allow_html=True)
+# ── Recovery scenario ───────────────────────────────────────────────────────────
+st.markdown('<div class="section-label">Recovery Scenario</div>', unsafe_allow_html=True)
 recovery_pct = st.slider(
-    "Expected Metal Recovery (%)",
+    "Uniform Screening Recovery (%)",
     min_value=10,
     max_value=95,
     value=70,
     step=5,
-    help="Estimated fraction of in-situ metal value recoverable after processing. Typical range: 50–85% for flotation of sulphide tailings.",
+    help="A user-selected value scenario applied uniformly to all metals. It is not a testwork result or recovery prediction.",
 )
 
 # ── Run button ──────────────────────────────────────────────────────────────────
 st.markdown("---")
-run = st.button("▶  RUN FEASIBILITY ANALYSIS")
+run = st.button("▶  RUN SCREENING ANALYSIS")
 
 # ── Analysis ────────────────────────────────────────────────────────────────────
 if run:
@@ -716,17 +876,41 @@ if run:
         st.error(f"Please fill in: {', '.join(missing)}")
         st.stop()
 
+    if price_mode == "Enter custom prices" and not custom_prices.strip():
+        st.error("Enter at least one custom price or select the built-in reference prices.")
+        st.stop()
+
+    if custom_price_errors:
+        error_lines = "\n".join(
+            f"- `{item['entry']}`: {item['reason']}"
+            for item in custom_price_errors
+        )
+        st.error("Please correct the custom price entries:\n" + error_lines)
+        st.stop()
+
     if not api_key:
-        st.error("GROQ_API_KEY is not configured in Streamlit secrets.")
+        st.error("GROQ_API_KEY is not configured in Streamlit secrets or the environment.")
         st.stop()
 
     client = Groq(api_key=api_key)
 
+    methods_text = ", ".join(mineral_readiness["methods"]) or "Not provided"
+    characterization_text = (
+        f"Methods: {methods_text}; modal mineralogy: {modal_mineralogy}; "
+        f"metal deportment: {metal_deportment}; liberation: {liberation}; "
+        f"sampling coverage: {spatial_coverage}; notes: {characterization_notes or 'Not provided'}"
+    )
+    readiness_summary = (
+        f"{mineral_readiness['status']} ({mineral_readiness['score']}/100 completeness). "
+        f"Gaps: {'; '.join(mineral_readiness['gaps']) or 'No core gaps identified from the selected fields.'}"
+    )
     inputs = {
         "source": source,
         "grades": grades,
         "tonnage": tonnage,
         "mineralogy": mineralogy,
+        "mineral_characterization": characterization_text,
+        "mineral_readiness_summary": readiness_summary,
         "oxidation": oxidation,
         "location": location,
         "infrastructure": infrastructure or "None specified",
@@ -778,12 +962,20 @@ if run:
     st.markdown("---")
     st.markdown('<div class="section-label">Analysis Results</div>', unsafe_allow_html=True)
 
-    # Fire all 5 API calls in parallel — they are fully independent
+    # Fire all five independent AI-support calls in parallel.
     with st.spinner("Running analysis (all modules in parallel)..."):
         with ThreadPoolExecutor(max_workers=5) as pool:
-            f_score  = pool.submit(get_feasibility_score,  client, inputs)
-            f_report = pool.submit(get_feasibility_report, client, inputs, metal_prices_text)
-            f_route  = pool.submit(get_processing_route,   client, inputs)
+            f_score = pool.submit(get_feasibility_score, client, inputs, mineral_readiness)
+            f_report = pool.submit(
+                get_feasibility_report,
+                client,
+                inputs,
+                metal_prices_text,
+                gross_value,
+                estimated_revenue,
+                recovery_pct,
+            )
+            f_route = pool.submit(get_processing_strategy, client, inputs, recovery_pct)
             f_plan   = pool.submit(get_action_plan,        client, inputs)
             f_econ   = pool.submit(
                 get_economic_summary,
@@ -793,15 +985,16 @@ if run:
                 estimated_revenue,
                 recovery_pct,
                 metal_prices_text,
-                econ_snapshot["annual_processing_rate"],
-                econ_snapshot["project_life_years"],
             )
 
     # Collect each result independently — one failure does not discard the rest
     try:
         score, sub_scores, score_fallback = f_score.result()
     except RuntimeError:
-        score, sub_scores, score_fallback = 60, {k: 3 for k in SCORE_RUBRIC}, True
+        score = 0
+        sub_scores = {k: 2 for k in SCORE_RUBRIC}
+        sub_scores["mineralogy"] = mineral_readiness["sub_score"]
+        score_fallback = True
 
     report, report_err = _safe_result(f_report)
     route,  route_err  = _safe_result(f_route)
@@ -815,8 +1008,8 @@ if run:
             st.markdown("""
             <div class="warning-box" style="text-align:center; padding:1.5rem;">
                 <div style="font-size:1rem; margin-bottom:0.4rem;">SCORE UNAVAILABLE</div>
-                <div style="font-size:0.8rem;">The scoring model returned an unexpected response.
-                Re-run the analysis to retry. The assessment below is still valid.</div>
+                <div style="font-size:0.8rem;">The AI-supported evidence score is unavailable.
+                Deterministic value and mineralogical-readiness results remain available below.</div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -831,7 +1024,7 @@ if run:
             st.markdown(f"""
             <div class="score-box">
                 <div class="score-number" style="color:{score_colour}">{score}</div>
-                <div class="score-label">Feasibility Score / 100</div>
+                <div class="score-label">Screening Evidence Score / 100</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -851,21 +1044,36 @@ if run:
                 </table>
                 <div style="margin-top:0.9rem; padding-top:0.8rem; border-top:1px solid #2a2520;">
                     <div style="font-size:0.72rem; color:#9a9080; font-family:'IBM Plex Mono',monospace; letter-spacing:1px; text-transform:uppercase; margin-bottom:0.6rem;">
-                        Score Band Definitions
+                        Evidence Band Definitions
                     </div>
                     <div style="font-size:0.78rem; color:#c8d0b0; line-height:1.65;">
-                        <strong>1/5:</strong> poor or high-risk
-                        <br><strong>2/5:</strong> weak or marginal
-                        <br><strong>3/5:</strong> moderate, possible with constraints
-                        <br><strong>4/5:</strong> strong under current conditions
-                        <br><strong>5/5:</strong> highly favourable
+                        <strong>1/5:</strong> evidence absent
+                        <br><strong>2/5:</strong> preliminary evidence
+                        <br><strong>3/5:</strong> partial supporting evidence
+                        <br><strong>4/5:</strong> representative evidence
+                        <br><strong>5/5:</strong> advanced-study evidence
                     </div>
                     <div style="font-size:0.74rem; color:#9a9080; margin-top:0.7rem; line-height:1.6;">
-                        Factor-specific definitions are applied from the internal rubric for grade, tonnage, mineralogy, infrastructure, and oxidation state.
+                        This measures input evidence readiness, not project feasibility, recovery, or profitability.
                     </div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
+
+        gap_items = "".join(f"<li>{gap}</li>" for gap in mineral_readiness["gaps"])
+        next_step_items = "".join(f"<li>{step}</li>" for step in mineral_readiness["next_steps"])
+        render_output_card(
+            "Mineralogical Evidence Readiness",
+            f"""
+            <div class="output-copy">
+                <p><strong>{mineral_readiness['status']}</strong>: {mineral_readiness['score']}/100 completeness.</p>
+                <div class="structured-label">Evidence Gaps</div>
+                <ul>{gap_items or '<li>No core gaps identified from the selected fields.</li>'}</ul>
+                <div class="structured-label">Next Characterization Steps</div>
+                <ul>{next_step_items or '<li>Proceed to independent review of the supplied evidence.</li>'}</ul>
+            </div>
+            """,
+        )
 
         # Gross value, per-metal breakdown, estimated revenue
         metal_rows = "".join(
@@ -895,7 +1103,7 @@ if run:
             </table>
             <div style="margin-top:0.8rem; padding-top:0.8rem; border-top:1px solid #2a2520;">
                 <div style="font-size:0.72rem; color:#9a9080; font-family:'IBM Plex Mono',monospace; letter-spacing:1px; text-transform:uppercase;">
-                    Estimated Revenue @ {recovery_pct}% Recovery
+                    Indicative Recovered Metal Value @ {recovery_pct}% Screening Scenario
                 </div>
                 <div style="font-family:'IBM Plex Mono',monospace; font-size:1.1rem; color:#c8d0b0; margin-top:0.3rem;">
                     USD {estimated_revenue:,.0f}
@@ -934,29 +1142,29 @@ if run:
 
     with right:
         if report_err:
-            render_output_card("Feasibility Assessment", f'<div class="warning-box">{report}<br>Re-run the analysis to retry.</div>')
+            render_output_card("Preliminary Screening Assessment", f'<div class="warning-box">{report}<br>Re-run the analysis to retry.</div>')
         else:
-            render_output_card("Feasibility Assessment", render_model_output_html(report, mode="generic"))
+            render_output_card("Preliminary Screening Assessment", render_model_output_html(report, mode="generic"))
 
-    # Processing route
+    # Characterization-led testwork strategy and bounded investigation plan
     col_a, col_b = st.columns(2)
     with col_a:
         if route_err:
-            render_output_card("Recommended Processing Route", f'<div class="warning-box">{route}<br>Re-run the analysis to retry.</div>')
+            render_output_card("Screening Testwork Strategy", f'<div class="warning-box">{route}<br>Re-run the analysis to retry.</div>')
         else:
             render_output_card(
-                "Recommended Processing Route",
+                "Screening Testwork Strategy",
                 render_key_value_sections(
                     route,
-                    ["RECOMMENDED ROUTE:", "RATIONALE:", "EXPECTED RECOVERY:", "ALTERNATIVES REJECTED:"],
+                    ["SCREENING STRATEGY:", "RATIONALE:", "CANDIDATE TESTS:", "ROUTE SELECTION STATUS:"],
                 ),
             )
 
     with col_b:
         if plan_err:
-            render_output_card("Action Plan", f'<div class="warning-box">{plan}<br>Re-run the analysis to retry.</div>')
+            render_output_card("Screening Investigation Plan", f'<div class="warning-box">{plan}<br>Re-run the analysis to retry.</div>')
         else:
-            render_output_card("Action Plan", render_action_plan_html(plan))
+            render_output_card("Screening Investigation Plan", render_action_plan_html(plan))
 
     # Economic summary
     if econ_err:
@@ -965,10 +1173,10 @@ if run:
         economic_snapshot_html = f"""
         <table class="sensitivity-table" style="margin-bottom:0.9rem;">
             <tr><th>Metric</th><th style="text-align:right;">Value</th></tr>
-            <tr><td>Recoverable Revenue</td><td style="text-align:right;">USD {estimated_revenue:,.0f}</td></tr>
-            <tr><td>Recovery Assumption</td><td style="text-align:right;">{recovery_pct}%</td></tr>
-            <tr><td>Annual Processing Rate</td><td style="text-align:right;">{econ_snapshot["annual_processing_rate"]:,.0f} t/year</td></tr>
-            <tr><td>Project Life</td><td style="text-align:right;">{econ_snapshot["project_life_years"]:.1f} years</td></tr>
+            <tr><td>Indicative Recovered Metal Value</td><td style="text-align:right;">USD {estimated_revenue:,.0f}</td></tr>
+            <tr><td>Uniform Recovery Scenario</td><td style="text-align:right;">{recovery_pct}%</td></tr>
+            <tr><td>Recovered Value per Tonne</td><td style="text-align:right;">USD {econ_snapshot["recoverable_value_per_tonne"]:,.2f}/t</td></tr>
+            <tr><td>Throughput and Project Life</td><td style="text-align:right;">Not provided</td></tr>
         </table>
         """
         render_output_card("Economic Summary", economic_snapshot_html + render_model_output_html(econ, mode="economic_summary"))

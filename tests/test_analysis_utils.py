@@ -3,9 +3,12 @@ import unittest
 from datetime import date
 
 from analysis_utils import (
+    action_plan_validation_issues,
+    assess_mineralogical_readiness,
     calculate_economic_snapshot,
     extract_json_object,
     is_price_reference_stale,
+    parse_custom_metal_prices,
     parse_gross_value_from_grades,
     render_action_plan_html,
     render_key_value_sections,
@@ -42,6 +45,48 @@ class ExtractJsonObjectTests(unittest.TestCase):
     def test_raises_when_no_json_object_exists(self):
         with self.assertRaises(json.JSONDecodeError):
             extract_json_object("No structured data returned")
+
+
+class ParseCustomMetalPricesTests(unittest.TestCase):
+    def test_overrides_prices_without_mutating_reference_set(self):
+        prices, errors = parse_custom_metal_prices("Mo: 60000, Cu: 9800", METAL_PRICES)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(prices["Mo"]["price"], 60000)
+        self.assertEqual(prices["Cu"]["price"], 9800)
+        self.assertEqual(METAL_PRICES["Mo"]["price"], 55000)
+
+    def test_rejects_malformed_unknown_and_nonpositive_prices(self):
+        _, errors = parse_custom_metal_prices("Mo 60000, Xx: 10, Au: 0", METAL_PRICES)
+
+        self.assertEqual(len(errors), 3)
+        self.assertEqual(errors[0]["reason"], "Use the format SYMBOL: price")
+        self.assertEqual(errors[1]["reason"], "Metal symbol not recognised: Xx")
+        self.assertEqual(errors[2]["reason"], "Price must be greater than zero")
+
+
+class MineralogicalReadinessTests(unittest.TestCase):
+    def test_empty_characterization_is_initial_evidence(self):
+        result = assess_mineralogical_readiness({})
+
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(result["sub_score"], 1)
+        self.assertEqual(result["status"], "Initial characterization evidence")
+        self.assertEqual(len(result["gaps"]), 5)
+
+    def test_complete_characterization_is_strong_evidence(self):
+        result = assess_mineralogical_readiness({
+            "methods": ["XRD", "QEMSCAN / MLA"],
+            "modal_mineralogy": "Quantitative modal mineralogy",
+            "metal_deportment": "Quantitative deportment measured",
+            "liberation": "Measured by size fraction",
+            "spatial_coverage": "Representative spatial programme",
+        })
+
+        self.assertEqual(result["score"], 100)
+        self.assertEqual(result["sub_score"], 5)
+        self.assertEqual(result["status"], "Strong characterization evidence")
+        self.assertEqual(result["gaps"], [])
 
 
 class ParseGrossValueFromGradesTests(unittest.TestCase):
@@ -122,11 +167,12 @@ class PriceReferenceStaleTests(unittest.TestCase):
 
 
 class EconomicSnapshotTests(unittest.TestCase):
-    def test_calculates_revenue_and_project_life_deterministically(self):
+    def test_calculates_value_without_inventing_throughput(self):
         snapshot = calculate_economic_snapshot(300_300_000, 70, 5_000_000)
         self.assertEqual(snapshot["estimated_revenue"], 210_210_000)
-        self.assertEqual(snapshot["annual_processing_rate"], 1_000_000)
-        self.assertEqual(snapshot["project_life_years"], 5)
+        self.assertEqual(snapshot["recoverable_value_per_tonne"], 42.042)
+        self.assertNotIn("annual_processing_rate", snapshot)
+        self.assertNotIn("project_life_years", snapshot)
 
 
 class RenderModelOutputHtmlTests(unittest.TestCase):
@@ -155,6 +201,13 @@ class RenderModelOutputHtmlTests(unittest.TestCase):
         self.assertIn("<p>CAPEX estimate range: USD 50M</p>", html)
         self.assertIn("<p>OPEX estimate: USD 10/t</p>", html)
 
+    def test_removes_horizontal_rules_and_supports_italic_text(self):
+        html = render_model_output_html("Intro\n---\n*Evidence note*<br>Next line")
+
+        self.assertNotIn("---", html)
+        self.assertIn("<em>Evidence note</em>", html)
+        self.assertIn("Next line", html)
+
 
 class RenderKeyValueSectionsTests(unittest.TestCase):
     def test_renders_processing_route_sections_as_structured_blocks(self):
@@ -165,6 +218,19 @@ class RenderKeyValueSectionsTests(unittest.TestCase):
         self.assertIn("structured-label", html)
         self.assertIn("RECOMMENDED ROUTE", html)
         self.assertIn("<li>Gravity: too fine</li>", html)
+
+    def test_normalizes_gpt_oss_bold_labels(self):
+        html = render_key_value_sections(
+            "**SCREENING STRATEGY:** Comparative testwork "
+            "**RATIONALE:** Evidence first "
+            "**CANDIDATE TESTS:**\n- Deportment study "
+            "**ROUTE SELECTION STATUS:** Deferred",
+            ["SCREENING STRATEGY:", "RATIONALE:", "CANDIDATE TESTS:", "ROUTE SELECTION STATUS:"],
+        )
+
+        self.assertIn("SCREENING STRATEGY", html)
+        self.assertIn("<li>Deportment study</li>", html)
+        self.assertIn("Deferred", html)
 
 
 class RenderActionPlanHtmlTests(unittest.TestCase):
@@ -206,6 +272,31 @@ class RenderActionPlanHtmlTests(unittest.TestCase):
         self.assertIn("<li>Review data</li>", html)
         self.assertIn("<li>Report</li>", html)
         self.assertIn("<li>Plan</li>", html)
+
+    def test_normalizes_numbered_gpt_oss_phases(self):
+        html = render_action_plan_html(
+            "1. Investigation & Sampling (3 months)\n"
+            "Key activities:\n- Review records\n"
+            "Key deliverables:\n- Sampling plan\n"
+            "Decision Gate 1: Representative samples available\n"
+            "2. Mineralogical Characterization & Testwork (4 months)\n"
+            "Key activities:\n- Measure deportment\n"
+            "Key deliverables:\n- Characterization report\n"
+            "Decision Gate 2: Evidence supports a separate feasibility study"
+        )
+
+        self.assertIn("<h3>Phase 1: Investigation &amp; Sampling (3 months)</h3>", html)
+        self.assertIn("<h3>Phase 2: Mineralogical Characterization &amp; Testwork (4 months)</h3>", html)
+
+    def test_detects_an_incomplete_two_phase_plan(self):
+        incomplete = (
+            "Phase 1: Investigation & Sampling\n"
+            "Key activities:\n- Sample\n"
+            "Key deliverables:\n- Plan\n"
+            "Decision Gate 1: Proceed"
+        )
+
+        self.assertIn("missing Phase 2", action_plan_validation_issues(incomplete))
 
 
 if __name__ == "__main__":
